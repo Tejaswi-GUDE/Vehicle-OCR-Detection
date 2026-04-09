@@ -1,11 +1,15 @@
+import os
 import re
 import cv2
+import easyocr
 import numpy as np
 
+reader = easyocr.Reader(['en'], gpu=False)
+
 INDIAN_PLATE_PATTERNS = [
-    r'^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$',
-    r'^[A-Z]{2}[0-9]{2}[A-Z]{1}[0-9]{4}$',
-    r'^[0-9]{2}BH[0-9]{4}[A-HJ-NP-Z]{1,2}$'
+    r'^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$',      # MH12AB1234
+    r'^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{3,4}$', # Flexible common Indian pattern
+    r'^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$'            # 22BH1234AB
 ]
 
 def clean_text(text):
@@ -36,8 +40,8 @@ def plate_score(text, conf):
         score += 0.5
     return score
 
-def detect_plate_regions(img_rgb):
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+def detect_plate_regions(img_bgr):
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.bilateralFilter(gray, 11, 17, 17)
 
     blackhat_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
@@ -45,8 +49,8 @@ def detect_plate_regions(img_rgb):
 
     grad_x = cv2.Sobel(blackhat, cv2.CV_32F, 1, 0, ksize=-1)
     grad_x = np.absolute(grad_x)
-    min_val, max_val = np.min(grad_x), np.max(grad_x)
 
+    min_val, max_val = np.min(grad_x), np.max(grad_x)
     if max_val - min_val != 0:
         grad_x = 255 * ((grad_x - min_val) / (max_val - min_val))
     grad_x = grad_x.astype("uint8")
@@ -57,12 +61,12 @@ def detect_plate_regions(img_rgb):
     rect_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 3))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, rect_kernel)
 
-    cnts, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     regions = []
-    h_img, w_img = img_rgb.shape[:2]
+    h_img, w_img = img_bgr.shape[:2]
 
-    for c in cnts:
+    for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         area = w * h
         aspect_ratio = w / float(h)
@@ -82,14 +86,14 @@ def detect_plate_regions(img_rgb):
         x2 = min(w_img, x + w + pad_x)
         y2 = min(h_img, y + h + pad_y)
 
-        crop = img_rgb[y1:y2, x1:x2]
-        regions.append((crop, (x1, y1, x2, y2), area))
+        crop = img_bgr[y1:y2, x1:x2]
+        regions.append((crop, area))
 
-    regions = sorted(regions, key=lambda r: r[2], reverse=True)
-    return regions[:5]
+    regions = sorted(regions, key=lambda r: r[1], reverse=True)
+    return [r[0] for r in regions[:5]]
 
-def generate_ocr_variants(crop_rgb):
-    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+def generate_ocr_variants(crop_bgr):
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.bilateralFilter(gray, 11, 17, 17)
 
     otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
@@ -101,16 +105,22 @@ def generate_ocr_variants(crop_rgb):
 
     return [gray, otsu, adaptive, enlarged_gray, enlarged_otsu]
 
-def extract_best_plate(img_rgb, reader):
-    candidates = []
+def extract_vehicle_number(image_path):
+    if not os.path.exists(image_path):
+        return "Error: Image file not found!"
 
-    plate_regions = detect_plate_regions(img_rgb)
+    img = cv2.imread(image_path)
+    if img is None:
+        return "Error: Unable to read image!"
+
+    candidates = []
+    plate_regions = detect_plate_regions(img)
 
     if not plate_regions:
-        plate_regions = [(img_rgb, None, img_rgb.shape[0] * img_rgb.shape[1])]
+        plate_regions = [img]
 
-    for crop_rgb, box, area in plate_regions:
-        variants = generate_ocr_variants(crop_rgb)
+    for crop in plate_regions:
+        variants = generate_ocr_variants(crop)
 
         for variant in variants:
             results = reader.readtext(
@@ -146,4 +156,43 @@ def extract_best_plate(img_rgb, reader):
                 count += 1
 
                 if len(text) >= 6:
-                   
+                    candidates.append((text, conf))
+
+                    corrected = normalize_common_misreads(text)
+                    if corrected != text:
+                        candidates.append((corrected, conf - 0.05))
+
+            if merged and count > 0:
+                avg_conf = conf_sum / count
+                if len(merged) >= 6:
+                    candidates.append((merged, avg_conf))
+
+                    corrected_merged = normalize_common_misreads(merged)
+                    if corrected_merged != merged:
+                        candidates.append((corrected_merged, avg_conf - 0.05))
+
+    if not candidates:
+        return "No valid plate detected"
+
+    unique_candidates = {}
+    for text, conf in candidates:
+        if text not in unique_candidates or conf > unique_candidates[text]:
+            unique_candidates[text] = conf
+
+    ranked = sorted(
+        unique_candidates.items(),
+        key=lambda x: plate_score(x[0], x[1]),
+        reverse=True
+    )
+
+    for text, conf in ranked:
+        if is_valid_indian_plate(text):
+            return text
+
+    return ranked[0][0] if ranked else "No valid plate detected"
+
+if __name__ == "__main__":
+    test_image = "test_plate.jpg"
+    print(f"Processing: {test_image} ...")
+    result = extract_vehicle_number(test_image)
+    print(f"Final Output: {result}")
